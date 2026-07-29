@@ -1,0 +1,9 @@
+# Optional dependencies for the A-share trend Agent workflow.
+#
+# Base project installation does not require these packages. Install them only
+# when wiring the A-share data, research adapters and LangGraph runtime.
+langgraph>=0.2.0
+clickhouse-connect>=0.8.0
+pyarrow>=15.0.0
+scikit-learn>=1.4.0
+matplotlib>=3.8.0

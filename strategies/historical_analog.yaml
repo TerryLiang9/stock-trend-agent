@@ -1,0 +1,127 @@
+# Historical Analog Day Model / 历史相似日模型
+# KNN-based historical analog matching for next-day direction prediction.
+
+name: historical_analog
+display_name: 历史相似日模型
+description: 基于KNN的历史相似日匹配模型。将每日市场状态编码为9维特征向量（日内结构、动量、量价、波动率），在历史中搜索K=20个最相似交易日，以反距离加权投票预测次日方向。优势：直观可展示历史案例，模型透明可审计。学术支撑：Huang (2023) Trend Characterization KNN；Gao (DECA 2023) Trend-Based KNN。
+category: framework
+core_rules: [1, 2, 3, 6]
+required_tools:
+  - historical_analog
+  - get_daily_history
+aliases: [相似日, 历史类比, analog, KNN, 近邻, 历史匹配, 历史相似]
+default_router: true
+default_active: true
+default_priority: 10
+market_regimes: [trending_up, trending_down, sideways, sector_hot]
+
+instructions: |
+  **历史相似日模型（Historical Analog Day Model）**
+
+  适用场景：
+  - 需要基于历史统计规律判断次日方向时使用。
+  - 寻找与当前市场特征最相似的历史交易日，以历史结果推测未来。
+  - 模型提供概率输出 + Walk-forward 历史回测验证，可客观评估信号质量。
+  - 特别适合展示"历史上类似情况后来怎么样了"的直观解释。
+
+  核心原理：
+  1. **9 维特征编码**：每天的市场状态被编码为 9 维特征向量：
+     | 特征 | 含义 | 数据来源 |
+     |------|------|----------|
+     | close_to_close_return | 收盘-收盘收益率 | 日线 |
+     | intraday_return | 日内收益率（close/open-1）| 日线 |
+     | range_return | 日内振幅（(high-low)/open）| 日线 |
+     | close_position | 收盘在日内位置（0~1）| 日线 |
+     | first_30m_return | 开盘30分钟动量 | 分钟线（缺则近似）|
+     | last_30m_return | 尾盘30分钟动量 | 分钟线（缺则近似）|
+     | momentum_5d | 5日价格动量 | 日线 |
+     | volume_ratio_20d | 量比（相对20日均量）| 日线 |
+     | volatility_5d | 5日波动率 | 日线 |
+
+  2. **KNN 匹配流程**：
+     ```
+     当前日 → 9维特征向量
+       → Z-score 标准化（用训练集均值和标准差）
+       → 欧氏距离计算与所有历史日的距离
+       → 选取 K=20 个最近邻
+       → 反距离加权投票: weight = 1/(distance + 0.20)
+       → P(UP) = Σw(UP)/Σw, P(FLAT) = Σw(FLAT)/Σw, P(DOWN) = Σw(DOWN)/Σw
+       → 预期收益 = Σ(w × next_return)/Σw
+     ```
+
+  3. **Walk-forward 回测验证**：
+     - 严格拓展窗口：每个时间点只用该日之前的数据训练，预测该日
+     - 输出：整体准确率、最近60天准确率、多数类基准、是否有统计优势(edge)
+
+  4. **方向判定**：
+     - argmax(P(UP), P(FLAT), P(DOWN)) → 预测方向
+     - FLAT 阈值 ±0.3%：当日收益在此范围内视为横盘
+     - 三概率接近（max < 40% 或 max-min < 10%）→ 强制"震荡"
+
+  关键解读规则：
+
+  - **概率分布**：
+    - P(UP) > 50%：历史上类似市场状态次日多数上涨
+    - P(FLAT) 最高：相似日多横盘，宜观望
+    - 三概率接近（各~33%）：历史无明确先例，方向完全不明
+
+  - **统计优势（has_historical_edge）**：
+    - true：模型 Walk-forward 准确率 > 多数类基准 → 有统计优势，信号可信
+    - false：模型准确率不优于简单基准 → 信号可靠性存疑
+
+  - **最近相似日（nearest_analogs）**：
+    - 检查 top-5 最近相似日的收益分布
+    - 全部同向 → 信号非常可靠
+    - 一半涨一半跌 → 即使概率最高，信号可靠性也低
+    - 最近距离过大（>5）→ 没有真正相似的历史先例
+
+  - **日线近似 vs 分钟数据**：
+    - minute_data_available=true：使用了真实日内特征（first_30m/last_30m），信号更精确
+    - minute_data_available=false：日内特征用日线近似（隔夜跳空代理），信号可能略粗糙
+
+  - **预期收益（expected_return）**：
+    - 接近零（±0.5%以内）→ 预期横盘，即使方向明确也不宜过度乐观
+
+  分析步骤：
+
+  1. **调用工具**：使用 `historical_analog` 工具获取历史相似日评估结果。
+     - 默认参数：k_neighbors=20, flat_threshold=0.003
+     - 如需更保守的大盘判断：k_neighbors=10（更严格匹配）
+     - 如需更平滑：k_neighbors=30（更多历史平均）
+
+  2. **解读方向与概率**：
+     - 检查 `probabilities` 三个概率值的分布。
+     - 检查 `warnings.degenerate_probabilities`：是否触发概率退化。
+     - 检查 `warnings.low_training_samples`：训练样本是否不足。
+
+  3. **审阅最近相似日**：
+     - 查看 `nearest_analogs` 中的 top-5 相似日。
+     - 关注它们实际次日涨跌（actual_class）是否一致。
+     - 如果相似日次日的涨跌方向混乱，信号可能不可靠。
+
+  4. **历史验证评估**：
+     - 检查 `walk_forward.has_historical_edge`：是否有统计优势。
+     - 检查 `walk_forward.overall_accuracy` vs `majority_baseline`。
+     - edge_magnitude > 0.05 → 统计优势明显。
+     - edge_magnitude < 0 → 模型甚至不如简单基准，极度谨慎。
+
+  5. **与其他策略联动**：
+     - 相似日模型提供**历史统计视角**（"历史上类似情况发生了什么"）。
+     - 与小波趋势模型交叉：小波方向=偏多 + 相似日 P(UP)>50% → 共振做多。
+     - 与逻辑回归6因子交叉：6因子涨跌概率 + 相似日方向概率 → 双引擎验证。
+     - 与缩量回踩联动：技术买点 + 相似日 P(UP) 高 → 统计和技术共振。
+     - 相似日 P(FLAT) 最高 + 小波 noise_ratio 高 → 震荡市，所有策略降低仓位。
+
+  6. **输出要点**：
+     - 在 buy_reason / sell_reason 中引用"历史相似日模型"。
+     - 提及具体的方向概率和最近相似日案例（如"历史上相似状态次日60%上涨"）。
+     - 如有概率退化或训练样本不足警告，必须披露。
+
+  评分调整建议：
+  - 方向明确 + has_historical_edge=true + P(pred) > 50%：sentiment_score +10
+  - 方向明确 + has_historical_edge=true + P(pred) > 60%：sentiment_score +15
+  - 方向明确 + has_historical_edge=false：sentiment_score +3（打折）
+  - P(pred) > 50% + nearest_analogs 收益一致同向：sentiment_score +5
+  - 三概率退化（degenerate_probabilities=true）：不加减分，标记"unsure"
+  - training_samples < 60：sentiment_score 调整幅度减半
+  - expected_return 接近零（±0.3%）：方向信号分量打折（×0.5）

@@ -1,0 +1,97 @@
+# Wavelet Trend Model / 小波趋势模型
+# Haar 小波分解 + 方向打分 = 盘前方向预测
+
+name: wavelet_trend
+display_name: 小波趋势模型
+description: 基于Haar小波分解的盘前方向预测模型。用日线对数价格的低频重构提取趋势信号，结合尾盘分钟趋势、价格偏离度、噪音占比等7维特征，加权打分后判定偏多/偏空/观望。优势：能拆分趋势与噪音，解释超跌/过热状态。
+category: trend
+core_rules: [1, 2, 3]
+required_tools:
+  - wavelet_trend
+  - get_daily_history
+aliases: [小波, 小波趋势, wavelet, 小波模型, 小波预测]
+default_router: true
+default_active: true
+default_priority: 8
+market_regimes: [trending_up, trending_down, sideways]
+
+instructions: |
+  **小波趋势模型（Wavelet Trend Model）**
+
+  适用场景：
+  - 盘前或盘后判断下一交易日/当日方向。
+  - 趋势市和震荡市均适用（噪音检测可区分环境）。
+  - 特别适合判断短期是否超跌可修复、超涨易回落。
+
+  核心原理：
+  1. **Haar 小波分解**：将价格序列拆分为低频趋势 + 高频噪音。
+     - level=3 → 8 日低频块，适合短线方向判断。
+  2. **7 维特征提取**：
+     | 特征 | 含义 | 权重方向 |
+     |------|------|----------|
+     | daily_trend | 日线低频块间趋势（最近 8 日 vs 前 8 日）| 正相关 |
+     | intra_trend | 前日尾盘分钟小波趋势（128 分钟）| 正相关 |
+     | residual_z | 当前价偏离低频趋势的 Z-score | 负相关（偏高扣分，偏低加分）|
+     | noise_ratio | 高频能量 / 总能量（噪音占比）| 折扣因子 |
+     | block_ret | 低频块原始收益率 | 辅助参考 |
+     | prev_oc | 前一日开盘-收盘收益 | 辅助参考 |
+     | prev_close_pos | 前一日收盘在日内位置 | 辅助参考 |
+  3. **打分公式**：
+     ```
+     raw_score = 0.50 × daily_trend + 0.35 × intra_trend - 0.15 × residual_z
+     noise_discount = max(0.50, 1.0 - 0.50 × noise_ratio)
+     final_score = raw_score × noise_discount
+     ```
+  4. **方向判定**（默认 threshold=0.20）：
+     - final_score > +0.20 → **偏多**
+     - final_score < -0.20 → **偏空**
+     - 中间 → **观望**
+
+  关键解读规则：
+  - **噪音 > 60%**：信号可信度显著降低，噪音折扣可能 > 30%。
+  - **噪音 > 80%**：模型强制输出"观望"，不强行判断方向。
+  - **residual_z > 1.5**：短线偏高，有回调压力（即使趋势向上也要谨慎追高）。
+  - **residual_z < -1.5**：短线偏低，有修复动力（超跌反弹机会）。
+  - **daily_trend 与 intra_trend 同向**：信号更可靠。
+  - **daily_trend 与 intra_trend 反向**：短线与中线矛盾，观望优先。
+  - **无分钟数据时**：intra_trend=0，仅用日线特征，信号强度可能减弱。
+  - **前一交易日涨跌停附近（±9.5%+）**：模型稳定性下降，需结合其他策略。
+
+  分析步骤：
+
+  1. **调用工具**：使用 `wavelet_trend` 工具获取小波趋势评估结果。
+     - 默认参数：window=32, level=3, threshold=0.20
+     - 如需更保守：threshold=0.25~0.30
+
+  2. **解读方向**：
+     - 检查 `data_quality.minute_data_available`：分钟数据是否存在。
+     - 检查 `warnings.high_noise_override`：是否触发噪音强制观望。
+     - 检查 `warnings.limit_warning`：是否有涨跌停警告。
+     - 查看 `interpretation` 字段获取自然语言解读。
+
+  3. **特征交叉验证**：
+     - 逐一检查 daily_trend、intra_trend、residual_z 的值和方向。
+     - 确认它们之间是否存在矛盾（如日线向上但偏离偏高）。
+     - noise_ratio < 0.3 → 信号清晰，可信度高。
+     - noise_ratio > 0.6 → 信号模糊，需结合其他策略。
+
+  4. **与其他策略联动**：
+     - 小波模型提供**趋势方向**和**噪音环境**判断。
+     - 结合均线金叉/多头排列策略：小波日线趋势向上 + MA 多头 → 做多信号共振。
+     - 结合缩量回踩策略：小波 residual_z 偏低 + 回踩均线支撑 → 低吸机会。
+     - 结合箱体震荡策略：小波 noise_ratio 高 + 箱体确认 → 震荡市策略优先。
+     - 与逻辑回归6因子模型比较：定量概率 vs 信号打分，取交集增强信心。
+
+  5. **输出要点**：
+     - 在 buy_reason / sell_reason 中引用"小波趋势模型"。
+     - 提及具体的方向、得分和关键特征值。
+     - 如有噪音警告或涨跌停警告，必须披露。
+
+  评分调整建议：
+  - 方向明确（非观望）+ 分钟数据可用：sentiment_score +10
+  - 方向明确 + noise_ratio < 0.3（信号清晰）：sentiment_score +5
+  - 方向明确 + 无分钟数据（信号减弱）：sentiment_score +5（而非 +10）
+  - residual_z < -1.5（超跌修复机会）：sentiment_score +3
+  - residual_z > 1.5（超买回调风险）：sentiment_score -5
+  - noise_ratio > 0.8（强制观望）：不加减分，标记"unsure"
+  - 方向=观望：不加减分（中性）
