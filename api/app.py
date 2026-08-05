@@ -270,10 +270,10 @@ async def app_lifespan(app: FastAPI):
         schedule_args_overrides=runtime_scheduler_args,
     )
     app.state.runtime_scheduler_service = runtime_scheduler_service
-    if not runtime_suppress_start:
-        app.state.runtime_scheduler_service.reconcile_from_config(
-            run_immediately=runtime_run_immediately,
-        )
+    # 即使在 serve-only 模式下也启动调度器（MA 趋势 + 全球指数后台任务仍需运行）
+    app.state.runtime_scheduler_service.reconcile_from_config(
+        run_immediately=runtime_run_immediately,
+    )
     app.state.system_config_service = SystemConfigService(
         runtime_scheduler=app.state.runtime_scheduler_service,
     )

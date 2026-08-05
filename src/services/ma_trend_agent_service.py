@@ -13,6 +13,85 @@ from uuid import uuid4
 
 from src.agent_system.adjudication.policy import AdjudicationPolicy
 from src.agent_system.adapters.base import default_model_adapters
+
+
+def _compute_rsi(close_prices, period: int = 14):
+    """计算 RSI 指标 (Wilder's smoothing)。返回最后一根 bar 的 RSI 值。"""
+    import pandas as pd
+    closes = pd.Series(close_prices)
+    delta = closes.diff()
+    gain = delta.clip(lower=0)
+    loss = (-delta).clip(lower=0)
+    avg_gain = gain.rolling(window=period, min_periods=period).mean()
+    avg_loss = loss.rolling(window=period, min_periods=period).mean()
+    # Wilder smoothing after initial SMA
+    for i in range(period, len(avg_gain)):
+        avg_gain.iloc[i] = (avg_gain.iloc[i - 1] * (period - 1) + gain.iloc[i]) / period
+        avg_loss.iloc[i] = (avg_loss.iloc[i - 1] * (period - 1) + loss.iloc[i]) / period
+    rs = avg_gain / avg_loss.replace(0, 1e-9)
+    rsi = 100.0 - (100.0 / (1.0 + rs))
+    last = rsi.dropna().iloc[-1] if len(rsi.dropna()) > 0 else 50.0
+    return float(last)
+
+
+def _apply_unanimous_override(
+    adjudication,
+    signals: list,
+    rows,
+    *,
+    rsi_oversold: float = 25.0,
+    rsi_overbought: float = 75.0,
+):
+    """当所有模型信号一致 + RSI 极端时，强制覆写方向为 neutral。
+
+    打破"全空"或"全多"的同质化偏差。
+    """
+    import logging
+    _log = logging.getLogger(__name__)
+
+    # 1. 检查是否全体一致
+    valid = [s for s in signals if s.direction in ("bullish", "bearish")]
+    if len(valid) < 2:
+        return adjudication
+
+    directions = {s.direction for s in valid}
+    if len(directions) != 1:
+        return adjudication  # 有分歧，不干预
+
+    unanimous_dir = directions.pop()
+
+    # 2. 计算 RSI
+    try:
+        close_prices = [r.close for r in rows if r.close and r.close > 0]
+        if len(close_prices) < 20:
+            return adjudication
+        rsi = _compute_rsi(close_prices)
+    except Exception:
+        return adjudication
+
+    # 3. 极端 RSI + 全体一致 → 覆写
+    if unanimous_dir == "bearish" and rsi < rsi_oversold:
+        _log.warning(
+            "反趋势覆写: 全体看空但 RSI=%.1f < %.0f (超卖), 强制 neutral",
+            rsi, rsi_oversold,
+        )
+        return adjudication.model_copy(update={
+            "direction": "neutral",
+            "reason_code": "unanimous_override_oversold",
+            "confidence": adjudication.confidence * 0.5,
+        })
+    elif unanimous_dir == "bullish" and rsi > rsi_overbought:
+        _log.warning(
+            "反趋势覆写: 全体看多但 RSI=%.1f > %.0f (超买), 强制 neutral",
+            rsi, rsi_overbought,
+        )
+        return adjudication.model_copy(update={
+            "direction": "neutral",
+            "reason_code": "unanimous_override_overbought",
+            "confidence": adjudication.confidence * 0.5,
+        })
+
+    return adjudication
 from src.agent_system.adapters.analog_adapter import map_analog_signal
 from src.agent_system.adapters.logistic_adapter import map_logistic_signal
 from src.agent_system.adapters.wavelet_adapter import map_wavelet_signal
@@ -33,7 +112,7 @@ from src.agent_system.schemas.execution import OrderExecutionResult, StrategyInt
 from src.agent_system.schemas.ma_prediction import MaPredictionOutcome, MaTrendPrediction
 from src.agent_system.schemas.request import TrendForecastRequest
 from src.agent_system.schemas.news_signal import NewsItem
-from src.core.trading_calendar import get_next_trading_date
+from src.core.trading_calendar import get_next_trading_date, resolve_target_date
 
 
 class MaTrendAgentService:
@@ -59,7 +138,7 @@ class MaTrendAgentService:
     def predict(self, request: TrendForecastRequest, *, news_items: Iterable[NewsItem] = ()) -> dict[str, Any]:
         run_id = request.run_id or f"ma-{request.symbol}-{uuid4().hex[:12]}"
         data_cutoff = request.data_cutoff or request.as_of
-        target_date = request.target_date or get_next_trading_date("cn", request.as_of.date())
+        target_date = request.target_date or resolve_target_date("cn", request.as_of)
         history_start = data_cutoff - timedelta(days=365 * 3)
         provider = self._resolve_provider(request)
         result = provider.load_market_data(symbol=request.symbol, history_start=history_start, data_cutoff=data_cutoff)
@@ -108,6 +187,12 @@ class MaTrendAgentService:
             ))
         adjudication = AdjudicationPolicy(news_weight_cap=self.config.news_weight_cap).decide(
             signals, configured_weights=self.config.model_weights.as_dict()
+        )
+        # 反趋势覆写：全体一致看空/看多 + RSI极端 → 强制neutral（打破同质化）
+        adjudication = _apply_unanimous_override(
+            adjudication, signals, result.rows,
+            rsi_oversold=self.config.parameters.rsi_oversold,
+            rsi_overbought=self.config.parameters.rsi_overbought,
         )
         output = {
             "run_id": run_id, "symbol": request.symbol, "as_of": request.as_of.isoformat(),

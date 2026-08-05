@@ -25,6 +25,8 @@ class MaParameters(BaseModel):
     volume_ratio_threshold: float = Field(default=1.2, gt=0)
     direction_score_threshold: float = Field(default=2.0, gt=0)
     neutral_band_pct: float = Field(default=0.5, ge=0)
+    rsi_oversold: float = Field(default=25.0, ge=10, le=40)
+    rsi_overbought: float = Field(default=75.0, ge=60, le=90)
 
     @model_validator(mode="after")
     def validate_windows(self) -> "MaParameters":
@@ -47,8 +49,7 @@ class ModelWeights(BaseModel):
     def validate_weights(self) -> "ModelWeights":
         if abs(sum(self.as_dict().values()) - 1.0) > 1e-6:
             raise ValueError("四个趋势模型权重之和必须为 1.0")
-        if self.moving_average <= max(self.wavelet, self.analog, self.logistic_6f):
-            raise ValueError("均线基线权重必须大于任一研究模型权重")
+        # 紧急模式下允许 MA 低于研究模型（由反思闭环触发）
         return self
 
     def as_dict(self) -> dict[str, float]:
@@ -78,6 +79,14 @@ class MaAgentConfig:
     llm_model: str
     llm_temperature: float
     agent_pipeline_enabled: bool
+    # 反思闭环
+    reflection_enabled: bool
+    emergency_accuracy_threshold: float
+    caution_accuracy_threshold: float
+    caution_7d_accuracy_threshold: float
+    bias_ratio_threshold: float
+    emergency_ma_min_weight: float
+    consecutive_low_days: int
 
     @classmethod
     def from_env(cls) -> "MaAgentConfig":
@@ -123,7 +132,10 @@ class MaAgentConfig:
             data_mode=data_mode,
             allow_minute_fallback=boolean("MA_AGENT_ALLOW_MINUTE_FALLBACK", False),
             symbols=symbols,
-            parameters=MaParameters(),
+            parameters=MaParameters(
+                rsi_oversold=float(values.get("MA_AGENT_RSI_OVERSOLD") or 25.0),
+                rsi_overbought=float(values.get("MA_AGENT_RSI_OVERBOUGHT") or 75.0),
+            ),
             model_weights=ModelWeights(
                 moving_average=float(values.get("MA_AGENT_WEIGHT_MOVING_AVERAGE") or 0.70),
                 wavelet=float(values.get("MA_AGENT_WEIGHT_WAVELET") or 0.10),
@@ -142,6 +154,13 @@ class MaAgentConfig:
             llm_model=(values.get("MA_AGENT_LLM_MODEL") or "").strip(),
             llm_temperature=float(values.get("MA_AGENT_LLM_TEMPERATURE") or 0.0),
             agent_pipeline_enabled=boolean("MA_AGENT_PIPELINE_ENABLED", False),
+            reflection_enabled=boolean("MA_AGENT_REFLECTION_ENABLED", False),
+            emergency_accuracy_threshold=float(values.get("MA_AGENT_EMERGENCY_ACCURACY_THRESHOLD") or 0.25),
+            caution_accuracy_threshold=float(values.get("MA_AGENT_CAUTION_ACCURACY_THRESHOLD") or 0.40),
+            caution_7d_accuracy_threshold=float(values.get("MA_AGENT_CAUTION_7D_ACCURACY_THRESHOLD") or 0.45),
+            bias_ratio_threshold=float(values.get("MA_AGENT_BIAS_RATIO_THRESHOLD") or 0.85),
+            emergency_ma_min_weight=float(values.get("MA_AGENT_EMERGENCY_MA_MIN_WEIGHT") or 0.25),
+            consecutive_low_days=int(values.get("MA_AGENT_CONSECUTIVE_LOW_DAYS") or 2),
         )
 
 

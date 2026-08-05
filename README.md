@@ -279,42 +279,64 @@ python main.py --webui-only
 
 > Agent 具体参数、`skill` 命名兼容、多 Agent 模式和预算护栏见 [完整指南](docs/full-guide.md#本地-webui-管理界面) 与 [LLM 配置指南](docs/LLM_CONFIG_GUIDE.md)。
 
-## 🧪 A 股趋势 Agent（实验性）
+## 🧪 A 股趋势 Agent
 
-项目已加入 A 股趋势 Agent：以均线模型为主（默认 70%），复用小波趋势、历史相似日和六因子逻辑回归，输出强多头控制、弱多头控制、多空拉锯、弱空头控制、强空头控制五类明日趋势研究结果。当前不接入新闻、舆情、自动交易或 Bot 通知。
+每日三个时间点自动运行，用数学模型 + LLM 预测自选股次日涨跌方向。
 
-- API 入口：`POST /api/v1/trend-forecast/runs`、`POST /api/v1/trend-forecast/daily-cycle`
-- 运行记录：`GET /api/v1/trend-forecast/runs/{run_id}`
-- 当前默认不影响现有 A 股分析主流程
-- 默认使用分钟行情；配置 `MA_AGENT_DATA_MODE=tick` 后优先使用 ClickHouse Tick 聚合
-- 研究模式不生成交易动作，`MA_AGENT_TRADING_MODE=disabled`
-- 默认权重：均线 `0.70`、小波 `0.10`、历史相似日 `0.10`、六因子 `0.10`，也可在 Web 设置页调整
-- 自动化和通知默认关闭：`AUTOMATION_ENABLED=false`、`NOTIFICATIONS_ENABLED=false`
-- `researcher_strategy/` 中已接入真实研究代码，`src/agent_system/adapters/` 负责把研究脚本包装成稳定 API 输出
+### 定时任务
 
-### 趋势 Agent 最小配置
+| 时间 | 任务 | 内容 |
+|---|---|---|
+| **09:25** | 早盘修正 | 拉取 SOXX/NIKKEI/KOSPI/HSI/HSTECH 全球指数 → 触发预警 → LLM 修正昨日预测 |
+| **11:35** | 午盘预测 | 重跑 4 模型 + 搜索实时新闻 + LLM 分析 + 外围事件覆写，用上午行情预测下午收盘 |
+| **16:30** | 盘后主预测 | 全流程：门禁 → 并行预测 → LLM → 评估 → 反思纠偏，预测下一个交易日 |
 
-在 `.env` 中配置：
+定时任务使用 DB 持久化的运行日志（`scheduler_run_log` 表），服务器重启后自动补跑错过的任务。
+
+### 预测流程（6 步）
+
+```
+Step 1  拉行情数据 → DB 缓存 → Efinance 网络回退
+Step 2  4 模型并行（13 只股票 ThreadPool 并行）
+        均线(50%) + 小波(20%) + KNN(15%) + 逻辑回归(15%)
+Step 3  Adjudication 加权裁定 → direction + score + trend_state
+        RSI 极端+全体一致 → 强制 neutral（打破同质化）
+Step 4  外围事件覆写 → 全球指数 ≥ ±3% 时推翻模型方向
+Step 5  搜索新闻 → Tavily 拉取每只股票实时新闻
+Step 6  LLM 独立分析 → DeepSeek 综合数学分数+全球背景+新闻 → JSON 输出
+```
+
+### 全球指数监控与覆写
+
+- 拉取 **SOXX**（费城半导体）、**NIKKEI**（日经225）、**KOSPI**（韩国）、**HSI**（恒生）、**HSTECH**（恒生科技）
+- ±2% 触发 **warning** 预警，±5% 触发 **critical** 预警，Dashboard 实时展示
+- 若有 ≥ 2 个指数同向 ≥ 3% 且至少一个 critical，自动覆写全部股票的方向为跟外围一致
+
+### Dashboard
+
+`http://<host>:8000/trend-dashboard` 提供：
+- 今日趋势预测：方向、LLM 判断、置信度、理由、创建/更新时间
+- 全球指数预警卡片（早盘/午盘/盘后时段标签）
+- 预测准确率趋势图
+- 历史方向日历
+
+### 最小配置
 
 ```dotenv
 MA_AGENT_ENABLED=true
 MA_AGENT_SYMBOLS=600519.SH,000001.SZ
-MA_AGENT_DATA_MODE=minute
-MA_AGENT_TRADING_MODE=disabled
-CLICKHOUSE_HOST=127.0.0.1
-CLICKHOUSE_DATABASE=stock
-CLICKHOUSE_USER=readonly
-CLICKHOUSE_PASSWORD=your_password
-CLICKHOUSE_MINUTE_TABLE=minute_bars
+MA_AGENT_LLM_ENABLED=true
+MA_AGENT_PIPELINE_ENABLED=true
+TAVILY_API_KEYS=<your_key>
 ```
 
 启动服务：
 
 ```powershell
-python main.py --serve-only
+python -m uvicorn api.app:app --host 0.0.0.0 --port 8000
 ```
 
-详细的 Tick 字段、五分类裁决、权重配置、参数反馈和排障说明见 [A 股趋势 Agent 编排说明](docs/trend-forecast-orchestration.md)。
+详细配置见 `.env` 中以 `MA_AGENT_` 开头的配置项，以及 [A 股趋势 Agent 编排说明](docs/trend-forecast-orchestration.md)。
 
 
 ## 🧩 相关项目 (Related Projects)

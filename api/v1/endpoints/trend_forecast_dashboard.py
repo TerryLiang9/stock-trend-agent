@@ -3,8 +3,19 @@
 
 from __future__ import annotations
 
-from datetime import date, datetime
+from datetime import date, datetime, timedelta, timezone
 from typing import Any, Dict, List, Optional
+
+CST = timezone(timedelta(hours=8))
+
+
+def _to_cst(dt: datetime | None) -> str | None:
+    """Convert naive UTC datetime to CST ISO string."""
+    if dt is None:
+        return None
+    if dt.tzinfo is None:
+        dt = dt.replace(tzinfo=timezone.utc)
+    return dt.astimezone(CST).strftime("%Y-%m-%d %H:%M:%S")
 
 from fastapi import APIRouter, HTTPException, Query
 from pydantic import BaseModel, Field
@@ -30,6 +41,17 @@ class LlmAnalysis(BaseModel):
     challenger_confidence: Optional[float] = 0.0   # 质疑者置信度
 
 
+class GlobalAlertItem(BaseModel):
+    """全球指数预警。"""
+    symbol: str
+    name: str
+    change_pct: float
+    alert_level: str          # warning / critical
+    alert_direction: str      # surge / plunge
+    summary: str
+    triggered_at: str
+
+
 class TodayPredictionItem(BaseModel):
     symbol: str
     direction: str
@@ -48,6 +70,7 @@ class DashboardSummary(BaseModel):
     today_predictions: List[TodayPredictionItem]
     prediction_date: Optional[str] = None
     target_date: Optional[str] = None
+    global_alerts: List[GlobalAlertItem] = []
 
 
 class PredictionItem(BaseModel):
@@ -61,6 +84,7 @@ class PredictionItem(BaseModel):
     confidence: float
     mode: str
     created_at: Optional[str] = None
+    updated_at: Optional[str] = None
     outcome: Optional[Dict[str, Any]] = None
     llm_analysis: Optional[LlmAnalysis] = None
 
@@ -119,6 +143,13 @@ def get_dashboard_summary(
     """获取趋势预测看板汇总统计。"""
     db = get_db()
     data = db.get_trend_forecast_dashboard_summary(symbol=symbol, days=days)
+    # 附加今日全球指数预警
+    try:
+        data["global_alerts"] = [
+            GlobalAlertItem(**a) for a in db.get_today_alerts()
+        ]
+    except Exception:
+        data["global_alerts"] = []
     return DashboardSummary(**data)
 
 
@@ -159,7 +190,8 @@ def get_dashboard_predictions(
             trend_state_label=r.trend_state_label,
             weighted_score=r.weighted_score, confidence=r.confidence,
             mode=r.mode,
-            created_at=r.created_at.isoformat() if r.created_at else None,
+            created_at=_to_cst(r.created_at),
+            updated_at=_to_cst(getattr(r, 'updated_at', None)),
             outcome=outcomes.get(int(r.id)),
             llm_analysis=llm_json,
         ))

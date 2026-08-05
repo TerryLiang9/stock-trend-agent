@@ -1128,6 +1128,7 @@ class TrendForecastPrediction(Base):
     data_cutoff = Column(DateTime, nullable=False)
     mode = Column(String(16), nullable=False, default="predict", index=True)
     created_at = Column(DateTime, default=utc_naive_now, index=True)
+    updated_at = Column(DateTime, default=utc_naive_now)
 
     # Core prediction values (denormalized from adjudication for query efficiency)
     direction = Column(String(16), nullable=False, index=True)  # bullish/neutral/bearish
@@ -1166,6 +1167,44 @@ class GlobalIndexData(Base):
 
     __table_args__ = (
         UniqueConstraint("symbol", "fetch_time", name="uix_global_idx_symbol_date"),
+    )
+
+
+class GlobalIndexAlert(Base):
+    """全球指数波动预警（±2% / ±5% 阈值触发）。"""
+
+    __tablename__ = "global_index_alerts"
+
+    id = Column(Integer, primary_key=True, autoincrement=True)
+    symbol = Column(String(16), nullable=False, index=True)  # SOXX/KOSPI/...
+    name = Column(String(32), nullable=False)  # 费城半导体/...
+    change_pct = Column(Float, nullable=False)
+    alert_level = Column(String(16), nullable=False, index=True)  # warning / critical
+    alert_direction = Column(String(16), nullable=False)  # surge（暴涨）/ plunge（暴跌）
+    summary = Column(String(256), nullable=False)  # "费城半导体暴涨 +6.55%"
+    triggered_at = Column(DateTime, nullable=False, index=True)  # 精确触发时间
+    acknowledged = Column(Boolean, default=False, nullable=False)
+    created_at = Column(DateTime, default=utc_naive_now)
+
+    __table_args__ = (
+        # 同一指数同一天只保留最新一条预警（多次拉取做 UPDATE）
+        UniqueConstraint("symbol", "created_at", name="uix_alert_symbol_date"),
+    )
+
+
+class SchedulerRunLog(Base):
+    """调度器任务执行日志——持久化替代内存 last_run_date，重启不丢。"""
+
+    __tablename__ = "scheduler_run_log"
+
+    id = Column(Integer, primary_key=True, autoincrement=True)
+    task_name = Column(String(64), nullable=False, index=True)
+    run_date = Column(Date, nullable=False, index=True)  # 执行日期
+    run_at = Column(DateTime, nullable=False)  # 精确执行时间
+    created_at = Column(DateTime, default=utc_naive_now)
+
+    __table_args__ = (
+        UniqueConstraint("task_name", "run_date", name="uix_scheduler_task_date"),
     )
 
 
@@ -3528,6 +3567,7 @@ class DatabaseManager(metaclass=_DatabaseManagerMeta):
             if existing is not None:
                 existing.run_id = run_id
                 existing.data_cutoff = data_cutoff
+                existing.mode = mode
                 existing.direction = direction
                 existing.trend_state = trend_state
                 existing.trend_state_label = trend_state_label
@@ -3537,7 +3577,9 @@ class DatabaseManager(metaclass=_DatabaseManagerMeta):
                 existing.adjudication_json = adjudication_json
                 existing.model_results_json = model_results_json
                 existing.data_quality_json = data_quality_json
-                existing.llm_analysis_json = llm_analysis_json
+                if llm_analysis_json is not None:
+                    existing.llm_analysis_json = llm_analysis_json
+                existing.updated_at = utc_naive_now()
                 session.flush()
                 return int(existing.id or 0)
             record = TrendForecastPrediction(
@@ -3628,6 +3670,105 @@ class DatabaseManager(metaclass=_DatabaseManagerMeta):
             logger.error(f"保存全球指数数据失败: {e}")
             return 0
 
+    def save_global_index_alert(
+        self,
+        symbol: str,
+        name: str,
+        change_pct: float,
+        alert_level: str,
+        alert_direction: str,
+        summary: str,
+        triggered_at: Optional[datetime] = None,
+    ) -> int:
+        """保存/更新全球指数预警（同一天同一指数 upsert）。"""
+        ft = triggered_at or datetime.now()
+
+        def _write(session: Session) -> int:
+            existing = session.execute(
+                select(GlobalIndexAlert).where(
+                    GlobalIndexAlert.symbol == symbol,
+                    func.date(GlobalIndexAlert.triggered_at) == func.date(ft),
+                )
+            ).scalar_one_or_none()
+            if existing is not None:
+                existing.change_pct = change_pct
+                existing.alert_level = alert_level
+                existing.alert_direction = alert_direction
+                existing.summary = summary
+                existing.triggered_at = ft
+                existing.acknowledged = False  # 有新数据时重置已读状态
+                session.flush()
+                return int(existing.id or 0)
+            record = GlobalIndexAlert(
+                symbol=symbol, name=name,
+                change_pct=change_pct, alert_level=alert_level,
+                alert_direction=alert_direction, summary=summary,
+                triggered_at=ft, created_at=utc_naive_now(),
+            )
+            session.add(record)
+            session.flush()
+            return int(record.id or 0)
+
+        try:
+            return self._run_write_transaction(f"save_global_alert[{symbol}]", _write)
+        except Exception as e:
+            logger.error(f"保存全球指数预警失败: {e}")
+            return 0
+
+    def get_today_alerts(self) -> List[Dict[str, Any]]:
+        """获取今日未确认的全球指数预警（默认今天）。"""
+        td = date.today()
+        with self.get_session() as session:
+            rows = session.execute(
+                select(GlobalIndexAlert).where(
+                    func.date(GlobalIndexAlert.triggered_at) == td.isoformat(),
+                    GlobalIndexAlert.acknowledged == False,
+                ).order_by(GlobalIndexAlert.alert_level.desc(), GlobalIndexAlert.triggered_at.desc())
+            ).scalars().all()
+            return [
+                {"symbol": r.symbol, "name": r.name,
+                 "change_pct": r.change_pct, "alert_level": r.alert_level,
+                 "alert_direction": r.alert_direction, "summary": r.summary,
+                 "triggered_at": r.triggered_at.isoformat() if r.triggered_at else ""}
+                for r in rows
+            ]
+
+    def has_run_today(self, task_name: str) -> bool:
+        """检查任务今天是否已执行过（持久化替代内存变量）。"""
+        td = date.today()
+        with self.get_session() as session:
+            row = session.execute(
+                select(SchedulerRunLog).where(
+                    SchedulerRunLog.task_name == task_name,
+                    SchedulerRunLog.run_date == td,
+                )
+            ).scalar_one_or_none()
+            return row is not None
+
+    def mark_run_today(self, task_name: str) -> None:
+        """标记任务今天已执行。"""
+        td = date.today()
+        now = datetime.now()
+
+        def _write(session: Session) -> None:
+            existing = session.execute(
+                select(SchedulerRunLog).where(
+                    SchedulerRunLog.task_name == task_name,
+                    SchedulerRunLog.run_date == td,
+                )
+            ).scalar_one_or_none()
+            if existing is not None:
+                existing.run_at = now
+            else:
+                session.add(SchedulerRunLog(
+                    task_name=task_name, run_date=td, run_at=now,
+                ))
+
+        try:
+            self._run_write_transaction(f"mark_run[{task_name}]", _write)
+        except Exception as e:
+            logger.error(f"标记调度任务执行失败 [{task_name}]: {e}")
+
     def get_global_index_data_for_date(self, target: Optional[date] = None) -> List[Dict[str, Any]]:
         """获取指定日期的全球指数数据（默认今天）。"""
         td = target or date.today()
@@ -3659,6 +3800,13 @@ class DatabaseManager(metaclass=_DatabaseManagerMeta):
         """保存趋势预测验证结果；返回主键 id，失败返回 0。"""
 
         def _write(session: Session) -> int:
+            # 先删除旧的 retryable/unable 记录，避免 UNIQUE 约束冲突
+            # （同一个 prediction_id 只能有一条 outcome，重新评估时需要覆盖旧记录）
+            session.execute(
+                delete(TrendForecastOutcome).where(
+                    TrendForecastOutcome.prediction_id == prediction_id
+                )
+            )
             record = TrendForecastOutcome(
                 prediction_id=prediction_id,
                 symbol=symbol,
@@ -3700,6 +3848,19 @@ class DatabaseManager(metaclass=_DatabaseManagerMeta):
             )
             return result
 
+    def get_predictions_for_date(
+        self,
+        target_date: date,
+    ) -> List[TrendForecastPrediction]:
+        """获取指定 target_date 的所有预测记录（用于早盘修正）。"""
+        with self.get_session() as session:
+            rows = session.execute(
+                select(TrendForecastPrediction)
+                .where(TrendForecastPrediction.target_date == target_date)
+                .order_by(TrendForecastPrediction.symbol)
+            ).scalars().all()
+            return list(rows)
+
     def get_trend_forecast_predictions(
         self,
         symbol: Optional[str] = None,
@@ -3708,9 +3869,16 @@ class DatabaseManager(metaclass=_DatabaseManagerMeta):
         offset: int = 0,
         limit: int = 20,
     ) -> Tuple[List[TrendForecastPrediction], int]:
-        """分页查询趋势预测记录。"""
+        """分页查询趋势预测记录。未指定 target_date 时默认只返回最新目标日期的预测。"""
         with self.get_session() as session:
             conditions = []
+            # 未指定 target_date 时，默认只返回最新目标日期的预测
+            if target_date is None:
+                latest = session.execute(
+                    select(func.max(TrendForecastPrediction.target_date))
+                ).scalar()
+                if latest:
+                    target_date = latest
             if symbol:
                 conditions.append(TrendForecastPrediction.symbol == symbol)
             if target_date:
@@ -3894,17 +4062,25 @@ class DatabaseManager(metaclass=_DatabaseManagerMeta):
                             d = "neutral"
                 direction_breakdown[d] = direction_breakdown.get(d, 0) + 1
 
-            # Outcome stats
-            outcome_where = pred_where  # reuse same filter, join via prediction_id
+            # Outcome stats — JOIN prediction 表以确保日期/股票筛选生效
+            outcome_conditions = [TrendForecastPrediction.created_at >= cutoff]
+            if symbol:
+                outcome_conditions.append(TrendForecastPrediction.symbol == symbol)
             evaluated_count = (
                 session.execute(
-                    select(func.count(TrendForecastOutcome.id)).where(TrendForecastOutcome.is_correct != None)
+                    select(func.count(TrendForecastOutcome.id))
+                    .join(TrendForecastPrediction,
+                          TrendForecastPrediction.id == TrendForecastOutcome.prediction_id)
+                    .where(and_(*outcome_conditions), TrendForecastOutcome.is_correct != None)
                 ).scalar()
                 or 0
             )
             correct_count = (
                 session.execute(
-                    select(func.count(TrendForecastOutcome.id)).where(TrendForecastOutcome.is_correct == True)
+                    select(func.count(TrendForecastOutcome.id))
+                    .join(TrendForecastPrediction,
+                          TrendForecastPrediction.id == TrendForecastOutcome.prediction_id)
+                    .where(and_(*outcome_conditions), TrendForecastOutcome.is_correct == True)
                 ).scalar()
                 or 0
             )
@@ -3916,17 +4092,22 @@ class DatabaseManager(metaclass=_DatabaseManagerMeta):
             ).scalar()
             avg_weighted_score = round(float(avg_score), 4) if avg_score is not None else 0.0
 
-            # Today's predictions
-            today = date.today()
-            today_rows = (
-                session.execute(
-                    select(TrendForecastPrediction)
-                    .where(TrendForecastPrediction.target_date >= today)
-                    .order_by(desc(TrendForecastPrediction.created_at))
+            # Today's predictions — 取最新 target_date（与 get_trend_forecast_predictions 逻辑一致）
+            latest_target = session.execute(
+                select(func.max(TrendForecastPrediction.target_date))
+            ).scalar()
+            if latest_target:
+                today_rows = (
+                    session.execute(
+                        select(TrendForecastPrediction)
+                        .where(TrendForecastPrediction.target_date == latest_target)
+                        .order_by(desc(TrendForecastPrediction.created_at))
+                    )
+                    .scalars()
+                    .all()
                 )
-                .scalars()
-                .all()
-            )
+            else:
+                today_rows = []
             today_predictions = []
             for r in today_rows:
                 # Direction 优先从 LLM 分析推导（与 direction_breakdown 一致）
@@ -3957,8 +4138,8 @@ class DatabaseManager(metaclass=_DatabaseManagerMeta):
                 "avg_weighted_score": avg_weighted_score,
                 "direction_breakdown": direction_breakdown,
                 "today_predictions": today_predictions,
-                "prediction_date": today.isoformat(),
-                "target_date": today_rows[0].target_date.isoformat() if today_rows else None,
+                "prediction_date": date.today().isoformat(),
+                "target_date": latest_target.isoformat() if latest_target else None,
             }
 
     def get_trend_forecast_accuracy_history(
@@ -3969,7 +4150,7 @@ class DatabaseManager(metaclass=_DatabaseManagerMeta):
         """获取每日准确率数据点，供前端画图。"""
         with self.get_session() as session:
             cutoff_date = date.today() - timedelta(days=days)
-            conditions = [TrendForecastOutcome.target_date >= cutoff_date]
+            conditions = [TrendForecastOutcome.target_date >= cutoff_date, TrendForecastOutcome.is_correct != None]
             if symbol:
                 conditions.append(TrendForecastOutcome.symbol == symbol)
             where_clause = and_(*conditions)
@@ -3977,9 +4158,7 @@ class DatabaseManager(metaclass=_DatabaseManagerMeta):
                 select(
                     TrendForecastOutcome.target_date,
                     func.count(TrendForecastOutcome.id).label("total"),
-                    func.sum(func.cast(func.coalesce(TrendForecastOutcome.is_correct, False), Integer)).label(
-                        "correct"
-                    ),
+                    func.sum(func.cast(TrendForecastOutcome.is_correct, Integer)).label("correct"),
                 )
                 .where(where_clause)
                 .group_by(TrendForecastOutcome.target_date)
@@ -4001,14 +4180,16 @@ class DatabaseManager(metaclass=_DatabaseManagerMeta):
     ) -> List[TrendForecastPrediction]:
         """获取尚未评估的预测记录（target_date 已过但无 Outcome）。"""
         with self.get_session() as session:
-            # Find predictions that don't have a matching outcome
-            subquery = select(TrendForecastOutcome.prediction_id)
+            # 只排除已完成评估的预测（is_correct 非空），retryable/unable 的需要重新评估
+            subquery = select(TrendForecastOutcome.prediction_id).where(
+                TrendForecastOutcome.is_correct != None
+            )
             conditions = [~TrendForecastPrediction.id.in_(subquery)]
             if target_date:
                 conditions.append(TrendForecastPrediction.target_date == target_date)
             else:
                 # Only predictions whose target_date is in the past
-                conditions.append(TrendForecastPrediction.target_date < date.today())
+                conditions.append(TrendForecastPrediction.target_date <= date.today())
             rows = session.execute(select(TrendForecastPrediction).where(and_(*conditions))).scalars().all()
             return list(rows)
 

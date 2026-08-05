@@ -22,7 +22,7 @@ export const trendDashboardApi = {
 
   async getPredictions(params: {
     symbol?: string;
-    targetDate?: string;
+    target_date?: string;
     direction?: string;
     page?: number;
     limit?: number;

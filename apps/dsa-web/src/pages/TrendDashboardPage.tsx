@@ -24,11 +24,11 @@ const DIRECTION_LABEL: Record<string, string> = {
 
 /** LLM Agent 判断徽章颜色（看多=红/看空=绿，与现有配色一致） */
 const LLM_ASSESSMENT_COLORS: Record<string, string> = {
-  '强多': 'bg-red-600 text-white',
-  '弱多': 'bg-red-300 text-red-900',
-  '中性': 'bg-gray-300 text-gray-700',
-  '弱空': 'bg-green-300 text-green-900',
-  '强空': 'bg-green-600 text-white',
+  '强多': 'bg-[hsl(var(--danger))] text-white',
+  '弱多': 'bg-[hsl(var(--danger)/0.15)] text-[hsl(var(--danger))]',
+  '中性': 'bg-muted text-secondary-text',
+  '弱空': 'bg-[hsl(var(--success)/0.15)] text-[hsl(var(--success))]',
+  '强空': 'bg-[hsl(var(--success))] text-white',
 };
 
 /** 强趋势加粗 + 下划线，弱趋势正常字重，便于一眼区分 */
@@ -39,6 +39,18 @@ function trendStateClass(label: string): string {
 }
 
 const WEEKDAY_ZH = ['周日', '周一', '周二', '周三', '周四', '周五', '周六'];
+
+/** 根据预警触发时间映射到标准时段标签 */
+function alertTimeSlot(isoStr: string): string {
+  const d = new Date(isoStr);
+  if (isNaN(d.getTime())) return '';
+  const h = d.getHours();
+  const m = d.getMinutes();
+  // 判断最接近哪个 slot
+  if (h < 10 || (h === 10 && m < 30)) return '早盘 09:25';
+  if (h < 14) return '午盘 11:35';
+  return '盘后 16:30';
+}
 
 function formatDateLabel(isoDate: string): string {
   const d = new Date(isoDate);
@@ -69,7 +81,7 @@ const TrendDashboardPage: React.FC = () => {
     const targetDate = date ?? (filterDate || undefined);
     const res = await trendDashboardApi.getPredictions({
       page: p, limit: 20,
-      ...(targetDate ? { targetDate } : {}),
+      ...(targetDate ? { target_date: targetDate } : {}),
     });
     setPredictions(res.items);
     setPage(p);
@@ -99,7 +111,7 @@ const TrendDashboardPage: React.FC = () => {
         trendDashboardApi.getAccuracyHistory({ days: 60 }),
         trendDashboardApi.getPredictions({
           page: 1, limit: 20,
-          ...(filterDate ? { targetDate: filterDate } : {}),
+          ...(filterDate ? { target_date: filterDate } : {}),
         }),
       ]);
       setSummary(s);
@@ -137,7 +149,7 @@ const TrendDashboardPage: React.FC = () => {
     setDetailLoading(true);
     try {
       const res = await trendDashboardApi.getPredictions({
-        targetDate: item.date,
+        target_date: item.date,
         page: 1,
         limit: 200,
       });
@@ -170,6 +182,43 @@ const TrendDashboardPage: React.FC = () => {
         </div>
       </div>
 
+      {/* 全球指数预警横幅 */}
+      {summary?.globalAlerts && summary.globalAlerts.length > 0 && (
+        <div className="space-y-2">
+          {summary.globalAlerts.map((alert, idx) => {
+            const isCritical = alert.alertLevel === 'critical';
+            return (
+              <div
+                key={idx}
+                className={`rounded-lg border-2 px-4 py-3 flex items-center gap-3 ${
+                  isCritical
+                    ? 'border-[hsl(var(--danger))] bg-[hsl(var(--danger)/0.08)]'
+                    : 'border-[hsl(var(--warning))] bg-[hsl(var(--warning)/0.08)]'
+                }`}
+              >
+                <span className="text-xl">{isCritical ? '🚨' : '⚠️'}</span>
+                <div className="flex-1">
+                  <p className={`text-sm font-semibold ${isCritical ? 'text-[hsl(var(--danger))]' : 'text-[hsl(var(--warning))]'}`}>
+                    {alert.name} {alert.alertDirection === 'surge' ? '暴涨' : '暴跌'} {(alert.changePct * 100).toFixed(2)}%
+                  </p>
+                  <p className="text-xs text-secondary-text mt-0.5">
+                    {alert.summary}
+                    <span className="ml-1 text-[10px] opacity-70">({alertTimeSlot(alert.triggeredAt)})</span>
+                  </p>
+                </div>
+                <span className={`text-xs px-2 py-0.5 rounded font-medium ${
+                  isCritical
+                    ? 'bg-[hsl(var(--danger))] text-white'
+                    : 'bg-[hsl(var(--warning))] text-white'
+                }`}>
+                  {isCritical ? '重大' : '预警'}
+                </span>
+              </div>
+            );
+          })}
+        </div>
+      )}
+
       {/* 统计卡片行 */}
       {summary && (
         <div className="grid grid-cols-2 lg:grid-cols-4 gap-4">
@@ -198,7 +247,7 @@ const TrendDashboardPage: React.FC = () => {
                 {summary.todayPredictions.map((item) => (
                   <div
                     key={item.symbol}
-                    className="flex items-start gap-3 rounded-lg border border-border/50 bg-elevated/50 px-3 py-2.5 hover:border-primary/30 transition-colors"
+                    className="flex items-start gap-3 rounded-lg border border-border/50 bg-elevated px-3 py-2.5 hover:border-primary/30 transition-colors"
                   >
                     {/* LLM 判断徽章 — 主分析 + 质疑者 */}
                     {item.llmAnalysis ? (
@@ -219,7 +268,7 @@ const TrendDashboardPage: React.FC = () => {
                         )}
                       </div>
                     ) : (
-                      <span className="text-xs px-2.5 py-1.5 rounded-md bg-gray-100 text-gray-400 shrink-0">-</span>
+                      <span className="text-xs px-2.5 py-1.5 rounded-md bg-muted text-muted-text shrink-0">-</span>
                     )}
                     {/* 右侧信息区 */}
                     <div className="min-w-0 flex-1 space-y-1.5">
@@ -239,10 +288,10 @@ const TrendDashboardPage: React.FC = () => {
                             style={{
                               width: `${Math.round(item.llmAnalysis.confidence * 100)}%`,
                               background: item.llmAnalysis.confidence >= 0.7
-                                ? 'var(--home-price-up)'
+                                ? 'hsl(var(--success))'
                                 : item.llmAnalysis.confidence >= 0.4
-                                  ? '#f59e0b'
-                                  : 'var(--home-price-down)',
+                                  ? 'hsl(var(--warning))'
+                                  : 'hsl(var(--danger))',
                             }}
                           />
                         </div>
@@ -312,7 +361,8 @@ const TrendDashboardPage: React.FC = () => {
                 <th className="py-2 pr-3 font-medium">LLM判断</th>
                 <th className="py-2 pr-3 font-medium">置信度</th>
                 <th className="py-2 pr-3 font-medium">理由</th>
-                <th className="py-2 font-medium">创建时间</th>
+                <th className="py-2 pr-3 font-medium">创建时间</th>
+                <th className="py-2 font-medium">更新时间</th>
               </tr>
             </thead>
             <tbody>
@@ -339,6 +389,11 @@ const TrendDashboardPage: React.FC = () => {
                   </td>
                   <td className="py-2 text-secondary-text text-xs">
                     {pred.createdAt ? new Date(pred.createdAt).toLocaleString('zh-CN') : '-'}
+                  </td>
+                  <td className="py-2 text-secondary-text text-xs">
+                    {pred.updatedAt && pred.updatedAt !== pred.createdAt
+                      ? new Date(pred.updatedAt).toLocaleString('zh-CN')
+                      : '-'}
                   </td>
                 </tr>
               ))}
@@ -484,6 +539,7 @@ const PredictionDetailItem: React.FC<{ pred: TrendPredictionItem }> = ({ pred })
       <div className="mt-3 grid gap-2 text-xs text-secondary-text sm:grid-cols-2">
         <DetailLine label="置信度" value={`${Math.round(pred.confidence * 100)}%`} />
         <DetailLine label="创建时间" value={pred.createdAt ? new Date(pred.createdAt).toLocaleString('zh-CN') : '-'} />
+        <DetailLine label="更新时间" value={pred.updatedAt && pred.updatedAt !== pred.createdAt ? new Date(pred.updatedAt).toLocaleString('zh-CN') : '-'} />
         <DetailLine label="实际方向" value={outcome?.actualDirection ? (DIRECTION_LABEL[outcome.actualDirection] ?? outcome.actualDirection) : '-'} />
         <DetailLine
           label="收益率"

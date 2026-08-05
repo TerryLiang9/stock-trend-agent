@@ -1,12 +1,13 @@
 # -*- coding: utf-8 -*-
 """全球指数定时拉取服务。
 
-在每日盘前分三个时段拉取外围市场指数数据：
-- 4:00  CST  费城半导体 SOXX（美股收盘后）
-- 8:30  CST  日经225、韩国KOSPI（亚太早盘）
-- 9:15  CST  恒生指数、恒生科技（港股开盘后）
+每日 09:25（北京时间）统一拉取外围市场指数：
+- SOXX 费城半导体（隔夜美股已收盘）
+- NIKKEI 日经225、KOSPI 韩国KOSPI（亚太早盘已运行 1.5h）
+- HSI 恒生指数、HSTECH 恒生科技（港股已开盘 25min）
 
-数据存入 global_index_data 表，16:30 LLM 分析时作为宏观背景注入 prompt。
+数据存入 global_index_data 表，±2% 波动自动触发预警；
+16:30 LLM 分析时作为宏观背景注入 prompt。
 """
 
 from __future__ import annotations
@@ -39,11 +40,12 @@ _INDEX_NAMES: Dict[str, str] = {
     "HSTECH": "恒生科技",
 }
 
-# 分时段分组
+# 所有指数统一在 09:25（北京时间）拉取：
+# 日韩已开盘 1.5h、港股开盘 25min、A 股 5min 后开盘，数据时效最佳
 _FETCH_SCHEDULES: Dict[str, List[str]] = {
-    "04:00": ["SOXX"],
-    "08:30": ["NIKKEI", "KOSPI"],
-    "09:15": ["HSI", "HSTECH"],
+    "09:25": ["SOXX", "NIKKEI", "KOSPI", "HSI", "HSTECH"],
+    "11:35": ["SOXX", "NIKKEI", "KOSPI", "HSI", "HSTECH"],
+    "16:30": ["SOXX", "NIKKEI", "KOSPI", "HSI", "HSTECH"],
 }
 
 
@@ -117,6 +119,51 @@ def fetch_indices_batch(codes: List[str]) -> List[Dict[str, Any]]:
     return results
 
 
+# ── 预警阈值 ─────────────────────────────────────────────────────────
+
+# 涨跌幅绝对值 ≥ 5% → critical, ≥ 2% → warning
+_ALERT_THRESHOLD_CRITICAL = 0.05
+_ALERT_THRESHOLD_WARNING = 0.02
+
+
+def _check_and_create_alert(data: Dict[str, Any]) -> None:
+    """检测全球指数涨跌幅是否超过预警阈值，超过则写入 alerts 表。"""
+    pct = data.get("change_pct")
+    if pct is None:
+        return
+    abs_pct = abs(float(pct))
+    # 确定预警等级
+    if abs_pct >= _ALERT_THRESHOLD_CRITICAL:
+        level = "critical"
+        emoji = "🚨"
+    elif abs_pct >= _ALERT_THRESHOLD_WARNING:
+        level = "warning"
+        emoji = "⚠️"
+    else:
+        return  # 不触发
+
+    direction = "surge" if pct > 0 else "plunge"
+    dir_zh = "暴涨" if pct > 0 else "暴跌"
+    name = data.get("name", data.get("symbol", "?"))
+    symbol = data.get("symbol", "?")
+
+    summary = f"{emoji} {name}({symbol}) {dir_zh} {pct*100:+.2f}%"
+
+    try:
+        db = get_db()
+        alert_id = db.save_global_index_alert(
+            symbol=symbol, name=name, change_pct=pct,
+            alert_level=level, alert_direction=direction,
+            summary=summary,
+        )
+        logger.info("[全球指数预警] %s (id=%s)", summary, alert_id)
+    except Exception as exc:
+        logger.exception("[全球指数预警] 保存失败: %s", exc)
+
+
+# ── 持久化 ───────────────────────────────────────────────────────────
+
+
 def fetch_and_save_global_index(code: str) -> bool:
     """Fetch one global index and persist to DB. Returns True on success."""
     data = fetch_global_index(code)
@@ -130,6 +177,7 @@ def fetch_and_save_global_index(code: str) -> bool:
             close_price=data["close"],
             change_pct=data["change_pct"],
         )
+        _check_and_create_alert(data)
         return True
     except Exception as exc:
         logger.exception("[全球指数] %s 保存失败: %s", code, exc)
@@ -150,6 +198,7 @@ def fetch_and_save_batch(codes: List[str]) -> Dict[str, bool]:
                 change_pct=data["change_pct"],
             )
             status[data["symbol"]] = True
+            _check_and_create_alert(data)
         except Exception as exc:
             logger.exception("[全球指数] %s 保存失败: %s", data["symbol"], exc)
             status[data["symbol"]] = False
@@ -190,7 +239,23 @@ def get_today_global_context() -> str:
     else:
         sentiment = "外围市场方向不明。"
 
-    return "## 今日全球市场背景\n" + "\n".join(lines) + f"\n{sentiment}"
+    result = "## 今日全球市场背景\n" + "\n".join(lines) + f"\n{sentiment}"
+
+    # ── 追加今日预警 ──
+    try:
+        alerts = db.get_today_alerts()
+        if alerts:
+            alert_lines: List[str] = []
+            for a in alerts:
+                # summary 已包含 emoji，直接使用
+                alert_lines.append(a["summary"])
+            if alert_lines:
+                result += "\n\n## ⚠️ 外围市场预警（今日）\n" + "\n".join(alert_lines)
+                result += "\n注意：外围市场出现显著波动，A股相关板块可能受影响。"
+    except Exception:
+        pass  # 预警取失败不影响主流程
+
+    return result
 
 
 # ── 调度分组信息 ──────────────────────────────────────────────────

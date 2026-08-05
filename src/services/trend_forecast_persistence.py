@@ -7,9 +7,11 @@ import json
 import logging
 from datetime import date, datetime
 from typing import Any, Dict, Optional
+from zoneinfo import ZoneInfo
 
 from src.agent_system.evaluation.outcome import evaluate_prediction
-from src.storage import get_db
+from src.core.trading_calendar import MarketPhase, infer_market_phase
+from src.storage import _parse_llm_json, get_db
 
 logger = logging.getLogger(__name__)
 
@@ -103,21 +105,45 @@ def evaluate_pending_predictions(
         return {"evaluated": 0, "correct": 0, "failed": 0}
 
     # 收集所有需要查询的 (symbol, target_date) 对
-    price_map: Dict[tuple, Optional[float]] = {}
-    from data_provider.base import DataFetcherManager
-    fetcher = DataFetcherManager()
+    # price_map: key → {"ref": prev_day_close, "target": target_day_close} or None
+    price_map: Dict[tuple, Optional[Dict[str, Optional[float]]]] = {}
+    from datetime import timedelta
+
+    def _to_ak_symbol(code: str) -> str:
+        """将 002747.SZ → sz002747, 600584.SH → sh600584"""
+        parts = code.upper().split(".")
+        suffix = parts[1].lower() if len(parts) > 1 else "sh"
+        return f"{suffix}{parts[0]}"
 
     for pred in pending:
+        # 守卫：如果 target_date 是今天且还没收盘，跳过（避免提前评估产生 retryable）
+        now_cst = datetime.now(ZoneInfo("Asia/Shanghai"))
+        if pred.target_date == now_cst.date():
+            phase = infer_market_phase("cn", now_cst)
+            if phase not in (MarketPhase.POSTMARKET, MarketPhase.NON_TRADING):
+                logger.debug(f"跳过 {pred.symbol}: target_date={pred.target_date} 尚未收盘")
+                continue
+
         key = (pred.symbol, str(pred.target_date))
         if key not in price_map:
             try:
-                df = fetcher.get_daily_data(
-                    code=pred.symbol,
-                    start=pred.target_date.isoformat(),
-                    end=pred.target_date.isoformat(),
+                import akshare as ak
+                prev_day = pred.target_date - timedelta(days=1)
+                ak_symbol = _to_ak_symbol(pred.symbol)
+                df = ak.stock_zh_a_daily(
+                    symbol=ak_symbol,
+                    start_date=prev_day.strftime("%Y%m%d"),
+                    end_date=pred.target_date.strftime("%Y%m%d"),
+                    adjust="",
                 )
                 if df is not None and not df.empty:
-                    price_map[key] = float(df.iloc[-1]["close"]) if "close" in df.columns else None
+                    # akshare 返回的列名是 'date' 和 'close'
+                    rows = len(df)
+                    target_close = float(df.iloc[-1]["close"]) if rows >= 1 else None
+                    prev_close = float(df.iloc[-2]["close"]) if rows >= 2 else None
+                    if prev_close is None or prev_close <= 0:
+                        prev_close = pred.reference_price if pred.reference_price and pred.reference_price > 0 else None
+                    price_map[key] = {"ref": prev_close, "target": target_close}
                 else:
                     price_map[key] = None
             except Exception as exc:
@@ -129,14 +155,42 @@ def evaluate_pending_predictions(
     failed = 0
 
     for pred in pending:
-        target_close = price_map.get((pred.symbol, str(pred.target_date)))
-        ref_price = pred.reference_price if pred.reference_price and pred.reference_price > 0 else 1.0
+        # 守卫：如果 target_date 是今天且还没收盘，跳过评估
+        now_cst = datetime.now(ZoneInfo("Asia/Shanghai"))
+        if pred.target_date == now_cst.date():
+            phase = infer_market_phase("cn", now_cst)
+            if phase not in (MarketPhase.POSTMARKET, MarketPhase.NON_TRADING):
+                continue
+
+        prices = price_map.get((pred.symbol, str(pred.target_date)))
+        if prices is None:
+            target_close = None
+            ref_price = pred.reference_price if pred.reference_price and pred.reference_price > 0 else 1.0
+        else:
+            target_close = prices["target"]
+            # 优先用真实前日收盘价，不可用时 fallback 到模型记录
+            ref_price = prices["ref"] if prices.get("ref") and prices["ref"] > 0 else (
+                pred.reference_price if pred.reference_price and pred.reference_price > 0 else 1.0
+            )
+        # 优先使用 LLM Agent 方向做评估，与看板展示一致
+        llm_direction = None
+        if pred.llm_analysis_json:
+            parsed = _parse_llm_json(pred.llm_analysis_json)
+            if parsed:
+                a = parsed.get("assessment", "")
+                if a in ("强多", "弱多"):
+                    llm_direction = "bullish"
+                elif a in ("强空", "弱空"):
+                    llm_direction = "bearish"
+                elif a == "中性":
+                    llm_direction = "neutral"
+        predicted_direction = llm_direction or pred.direction
         try:
             outcome = evaluate_prediction(
                 prediction_id=pred.id,
                 symbol=pred.symbol,
                 target_date=pred.target_date,
-                predicted_direction=pred.direction,
+                predicted_direction=predicted_direction,
                 reference_price=ref_price,
                 target_close=target_close,
                 neutral_band_pct=neutral_band_pct,

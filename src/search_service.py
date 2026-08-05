@@ -902,8 +902,8 @@ class BochaSearchProvider(BaseSearchProvider):
             )
         
         try:
-            # API 端点
-            url = "https://api.bocha.cn/v1/web-search"
+            # API 端点（兼容新旧域名：open.bochaai.com 使用 bochaai.com）
+            url = "https://api.bochaai.com/v1/web-search"
             
             # 请求头
             headers = {

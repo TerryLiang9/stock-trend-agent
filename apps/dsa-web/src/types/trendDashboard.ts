@@ -1,3 +1,13 @@
+export interface GlobalAlert {
+  symbol: string;
+  name: string;
+  changePct: number;
+  alertLevel: string;       // warning | critical
+  alertDirection: string;   // surge | plunge
+  summary: string;
+  triggeredAt: string;
+}
+
 export interface TrendDashboardSummary {
   totalPredictions: number;
   totalEvaluated: number;
@@ -8,6 +18,7 @@ export interface TrendDashboardSummary {
   todayPredictions: TodayPredictionItem[];
   predictionDate: string | null;
   targetDate: string | null;
+  globalAlerts: GlobalAlert[];
 }
 
 export interface LlmAnalysis {
@@ -40,6 +51,7 @@ export interface TrendPredictionItem {
   confidence: number;
   mode: string;
   createdAt: string | null;
+  updatedAt: string | null;
   outcome?: TrendOutcomeItem | null;
   llmAnalysis?: LlmAnalysis | null;
 }

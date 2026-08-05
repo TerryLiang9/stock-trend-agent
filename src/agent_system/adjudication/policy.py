@@ -25,7 +25,7 @@ class AdjudicationPolicy:
         all_signals = list(signals)
         if configured_weights is not None:
             result = calculate_weighted_trend(all_signals, configured_weights)
-            direction = "bullish" if result.weighted_score >= 0.20 else "bearish" if result.weighted_score <= -0.20 else "neutral"
+            direction = "bullish" if result.weighted_score >= 0.30 else "bearish" if result.weighted_score <= -0.30 else "neutral"
             return AdjudicationDecision(
                 action="abstain", direction=direction, confidence=abs(result.weighted_score),
                 reason_code="five_level_weighted_consensus", signals=all_signals,

@@ -244,6 +244,26 @@ def get_next_trading_date(
     return candidate
 
 
+def resolve_target_date(
+    market: str, as_of: datetime,
+) -> date:
+    """根据市场阶段决定预测目标日期。
+
+    收盘后（POSTMARKET / NON_TRADING）→ 下一个交易日
+    盘前/盘中（PREMARKET / INTRADAY / CLOSING_AUCTION / LUNCH_BREAK）→ 今天（交易日）
+    """
+    phase = infer_market_phase(market, as_of)
+    today = as_of.date()
+
+    if phase in {MarketPhase.POSTMARKET, MarketPhase.NON_TRADING}:
+        return get_next_trading_date(market, today)
+
+    if is_market_open(market, today):
+        return today
+
+    return get_next_trading_date(market, today)
+
+
 def _as_market_datetime(value: Any, tz_name: str) -> Optional[datetime]:
     """
     Convert exchange-calendar timestamps into market-local datetimes.

@@ -22,6 +22,14 @@ const DIRECTION_LABEL: Record<string, string> = {
 
 const WEEKDAY_LABELS = ['日', '一', '二', '三', '四', '五', '六'];
 
+const CURRENT_YEAR = new Date().getFullYear();
+const YEAR_OPTIONS = Array.from({ length: CURRENT_YEAR - 2024 }, (_, i) => 2025 + i);
+const MONTH_OPTIONS = Array.from({ length: 12 }, (_, i) => i + 1);
+
+/** inline select 共用样式，匹配页面深色/暖色主题 */
+const SELECT_CLS =
+  'input-surface h-7 appearance-none rounded-lg border bg-transparent px-1.5 text-xs text-foreground cursor-pointer hover:border-primary/40 transition-colors focus:outline-none focus:ring-1 focus:ring-primary/50';
+
 interface CalendarCell {
   key: string;
   date: Date | null;
@@ -94,7 +102,7 @@ export const TrendDirectionCalendar: React.FC<TrendDirectionCalendarProps> = ({
   onSelectDate,
   onMonthChange,
 }) => {
-  const { title, cells } = useMemo(
+  const { cells } = useMemo(
     () => buildCalendarCells(items, year, month),
     [items, year, month],
   );
@@ -115,7 +123,7 @@ export const TrendDirectionCalendar: React.FC<TrendDirectionCalendarProps> = ({
         <div className="flex min-w-0 items-center gap-2">
           <CalendarDays className="h-4 w-4 shrink-0 text-primary" aria-hidden="true" />
           <h3 className="text-sm font-medium text-foreground">方向日历</h3>
-          {/* 月份导航 */}
+          {/* 月份导航：箭头 + 年/月下拉选择器 */}
           <div className="flex items-center gap-1 ml-1">
             <button
               type="button"
@@ -125,7 +133,28 @@ export const TrendDirectionCalendar: React.FC<TrendDirectionCalendarProps> = ({
             >
               <ChevronLeft className="h-3.5 w-3.5" />
             </button>
-            <span className="text-xs text-secondary-text min-w-[80px] text-center">{title}</span>
+            <select
+              value={year}
+              onChange={(e) => onMonthChange(Number(e.target.value), month)}
+              className={SELECT_CLS}
+              aria-label="选择年份"
+            >
+              {YEAR_OPTIONS.map((y) => (
+                <option key={y} value={y} className="bg-elevated text-foreground">{y}</option>
+              ))}
+            </select>
+            <span className="text-xs text-secondary-text">年</span>
+            <select
+              value={month}
+              onChange={(e) => onMonthChange(year, Number(e.target.value))}
+              className={SELECT_CLS}
+              aria-label="选择月份"
+            >
+              {MONTH_OPTIONS.map((m) => (
+                <option key={m} value={m} className="bg-elevated text-foreground">{m}</option>
+              ))}
+            </select>
+            <span className="text-xs text-secondary-text">月</span>
             <button
               type="button"
               onClick={handleNextMonth}

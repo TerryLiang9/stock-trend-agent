@@ -260,14 +260,19 @@ def _save_reviews(db, items: List[dict], diagnoses: List[dict]) -> None:
         logger.warning("[预测回顾] 持久化失败（诊断结果仅日志输出）: %s", exc)
 
 
-def propose_weight_adjustments(days: int = 30) -> Dict[str, Any]:
+def propose_weight_adjustments(days: int = 30, *, emergency: bool = False) -> Dict[str, Any]:
     """基于历史错误模式，建议调整 4 个模型的权重。
 
     规则：
     1. 统计每个模型在错误预测中作为 culprit 的次数
     2. 统计每个模型的独立命中率（该模型方向 = 实际方向）
     3. 犯错多的模型降权，准确率高的模型升权
-    4. MA 权重不低于 40%，不高于 60%
+    4. 正常模式：MA 权重不低于 40%，不高于 60%
+    5. 紧急模式：突破 MA 约束，允许激进调整
+
+    Args:
+        days: 统计天数
+        emergency: 紧急模式，突破 MA 40-60% 约束
 
     Returns:
         {current_weights, proposed_weights, reasons, confidence}
@@ -354,19 +359,20 @@ def propose_weight_adjustments(days: int = 30) -> Dict[str, Any]:
         best = max(proposed, key=proposed.get)
         proposed[best] = round(proposed[best] + diff, 2)
 
-    # 约束 MA 在 40%-60%
-    if proposed["moving_average"] < 0.40:
-        deficit = 0.40 - proposed["moving_average"]
-        proposed["moving_average"] = 0.40
-        others = [m for m in proposed if m != "moving_average"]
-        for m in others:
-            proposed[m] = round(max(0.05, proposed[m] - deficit / len(others)), 2)
-    elif proposed["moving_average"] > 0.60:
-        excess = proposed["moving_average"] - 0.60
-        proposed["moving_average"] = 0.60
-        others = [m for m in proposed if m != "moving_average"]
-        for m in others:
-            proposed[m] = round(proposed[m] + excess / len(others), 2)
+    # 约束 MA 在 40%-60%（紧急模式跳过此限制）
+    if not emergency:
+        if proposed["moving_average"] < 0.40:
+            deficit = 0.40 - proposed["moving_average"]
+            proposed["moving_average"] = 0.40
+            others = [m for m in proposed if m != "moving_average"]
+            for m in others:
+                proposed[m] = round(max(0.05, proposed[m] - deficit / len(others)), 2)
+        elif proposed["moving_average"] > 0.60:
+            excess = proposed["moving_average"] - 0.60
+            proposed["moving_average"] = 0.60
+            others = [m for m in proposed if m != "moving_average"]
+            for m in others:
+                proposed[m] = round(proposed[m] + excess / len(others), 2)
 
     # 理由
     reasons = []
@@ -403,7 +409,7 @@ def propose_weight_adjustments(days: int = 30) -> Dict[str, Any]:
                 from_weights=json.dumps(current),
                 to_weights=json.dumps(proposed),
                 reasons=json.dumps(reasons, ensure_ascii=False),
-                confidence=min(1.0, len(rows) / 50),  # 样本越多信心越高
+                confidence=min(1.0, len(rows) / (10 if emergency else 50)),  # 紧急模式降低样本要求
             )
             session.add(log)
             session.commit()
@@ -419,6 +425,102 @@ def propose_weight_adjustments(days: int = 30) -> Dict[str, Any]:
         "sample_size": len(rows),
         "confidence": min(1.0, len(rows) / 50),
     }
+
+
+_WEIGHT_ENV_MAP: Dict[str, str] = {
+    "moving_average": "MA_AGENT_WEIGHT_MOVING_AVERAGE",
+    "wavelet": "MA_AGENT_WEIGHT_WAVELET",
+    "analog": "MA_AGENT_WEIGHT_ANALOG",
+    "logistic_6f": "MA_AGENT_WEIGHT_LOGISTIC_6F",
+}
+
+
+def _update_env_file(env_path: "Path", updates: Dict[str, str]) -> None:
+    """安全更新 .env 文件中的指定键值，保留原有顺序和注释。"""
+    import shutil
+    from pathlib import Path as _Path
+
+    env_path = _Path(env_path)
+    if not env_path.exists():
+        logger.warning("[权重应用] .env 文件不存在: %s", env_path)
+        return
+
+    # 读取原文件
+    lines = env_path.read_text(encoding="utf-8").splitlines(keepends=True)
+    updated_keys: set[str] = set()
+
+    for i, line in enumerate(lines):
+        stripped = line.strip()
+        if not stripped or stripped.startswith("#") or "=" not in stripped:
+            continue
+        key = stripped.split("=", 1)[0].strip()
+        if key in updates:
+            lines[i] = f"{key}={updates[key]}\n"
+            updated_keys.add(key)
+
+    # 追加未找到的新键
+    for key, value in updates.items():
+        if key not in updated_keys:
+            lines.append(f"{key}={value}\n")
+            logger.info("[权重应用] .env 新增: %s=%s", key, value)
+
+    # 先备份再写入
+    backup = env_path.with_suffix(".env.bak")
+    try:
+        shutil.copy2(env_path, backup)
+    except OSError:
+        pass
+    env_path.write_text("".join(lines), encoding="utf-8")
+    logger.info("[权重应用] .env 已更新 %d 个键", len(updates))
+
+
+def apply_weight_adjustments(proposed: Dict[str, float]) -> Dict[str, Any]:
+    """将建议权重写入运行时环境变量和 .env 文件，确保下次预测生效。
+
+    Args:
+        proposed: {model_name: new_weight, ...}  e.g. {"moving_average": 0.40, ...}
+
+    Returns:
+        {applied: {...}, env_updated: bool, validated: bool}
+    """
+    import os as _os
+    from pathlib import Path as _Path
+
+    env_updates: Dict[str, str] = {}
+    applied: Dict[str, float] = {}
+
+    for model_key, env_key in _WEIGHT_ENV_MAP.items():
+        if model_key in proposed:
+            value = float(proposed[model_key])
+            str_value = f"{value:.2f}"
+            env_updates[env_key] = str_value
+            _os.environ[env_key] = str_value
+            applied[model_key] = value
+
+    if not applied:
+        return {"applied": {}, "env_updated": False, "validated": False,
+                "error": "no matching model keys in proposed weights"}
+
+    # 验证权重总和
+    total = sum(applied.values())
+    validated = abs(total - 1.0) < 0.02  # 允许 2% 浮动
+
+    # 持久化到 .env
+    env_path = _Path(__file__).resolve().parent.parent.parent / ".env"
+    try:
+        _update_env_file(env_path, env_updates)
+        env_updated = True
+    except Exception as exc:
+        logger.warning("[权重应用] .env 更新失败（运行时仍生效）: %s", exc)
+        env_updated = False
+
+    logger.info(
+        "[权重应用] %s → 总和=%.2f %s",
+        {k: f"{v:.0%}" for k, v in applied.items()},
+        total,
+        "✓" if validated else "⚠ 权重和偏离1.0",
+    )
+    return {"applied": applied, "env_updated": env_updated, "validated": validated}
 
 
 def get_error_summary(days: int = 30) -> Dict[str, Any]:

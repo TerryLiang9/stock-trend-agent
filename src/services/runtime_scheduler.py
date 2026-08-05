@@ -100,17 +100,37 @@ def build_agent_event_monitor_background_tasks(
 _MA_TREND_TASK_NAME = "ma_trend_daily_cycle"
 
 
+def _schedule_passed(hour: int, minute: int, now: datetime) -> bool:
+    """Check if the scheduled time has passed today (catches up after restart)."""
+    return now.hour > hour or (now.hour == hour and now.minute >= minute)
+
+
+def _should_fire(task_name: str, hour: int, minute: int, now: datetime) -> bool:
+    """Return True if today is a weekday, the schedule has passed, and not yet run."""
+    if now.date().weekday() >= 5:
+        return False
+    if not _schedule_passed(hour, minute, now):
+        return False
+    from src.storage import get_db
+    if get_db().has_run_today(task_name):
+        return False
+    return True
+
+
+def _mark_fired(task_name: str) -> None:
+    from src.storage import get_db
+    get_db().mark_run_today(task_name)
+
+
 def build_ma_trend_background_tasks(
     _config: Config,
 ) -> List[Dict[str, Any]]:
-    """Build a background task that triggers the MA trend daily cycle at the
-    configured ``MA_AGENT_SCHEDULE_TIME`` (default 16:30 Asia/Shanghai).
+    """Build all MA trend background tasks.
 
-    The task polls every 60 seconds and fires at most once per calendar day.
-    If ``MA_AGENT_ENABLED`` is not set or false, returns an empty list.
+    All tasks use DB-persisted run logs so a process restart does NOT
+    prevent the task from firing later (catch-up via _schedule_passed).
     """
     import os
-    from datetime import date as date_type
     from zoneinfo import ZoneInfo
 
     enabled = os.getenv("MA_AGENT_ENABLED", "").strip().lower() in {"1", "true", "yes", "on"}
@@ -123,42 +143,90 @@ def build_ma_trend_background_tasks(
     except (ValueError, TypeError):
         schedule_hour, schedule_minute = 16, 30
 
-    last_run_date: date_type | None = None
-
     def ma_trend_task() -> None:
-        nonlocal last_run_date
-
         now = datetime.now(ZoneInfo("Asia/Shanghai"))
-        today = now.date()
-
-        # Weekend guard — skip Saturday (5) and Sunday (6)
-        if today.weekday() >= 5:
+        if not _should_fire(_MA_TREND_TASK_NAME, schedule_hour, schedule_minute, now):
             return
-
-        # Already ran today
-        if last_run_date == today:
-            return
-
-        # Not yet the scheduled minute
-        if now.hour != schedule_hour or now.minute != schedule_minute:
-            return
-
-        last_run_date = today
+        _mark_fired(_MA_TREND_TASK_NAME)
         logger.info("[MaTrend] 触发每日趋势预测周期: %s", now.isoformat())
         try:
             from src.services.ma_trend_scheduler import run_daily_ma_cycle
-
             result = run_daily_ma_cycle()
             logger.info("[MaTrend] 每日趋势周期完成: %s", result.get("predict", {}).get("status"))
         except Exception as exc:
             logger.exception("[MaTrend] 每日趋势周期失败: %s", exc)
 
-    return [{
+    # 早盘修正任务（09:25：先拉全球指数，再 LLM 修正昨日预测）
+    morning_time_str = os.getenv("MA_AGENT_MORNING_REVISION_TIME", "09:25").strip()
+    morning_enabled = os.getenv("MA_AGENT_MORNING_REVISION_ENABLED", "").strip().lower() in {"1", "true", "yes", "on"}
+    try:
+        morning_hour, morning_minute = map(int, morning_time_str.split(":"))
+    except (ValueError, TypeError):
+        morning_hour, morning_minute = 9, 25
+    _MORNING_TASK_NAME = "ma_trend_morning_revision"
+
+    def morning_revision_task() -> None:
+        now = datetime.now(ZoneInfo("Asia/Shanghai"))
+        if not _should_fire(_MORNING_TASK_NAME, morning_hour, morning_minute, now):
+            return
+        _mark_fired(_MORNING_TASK_NAME)
+        logger.info("[MaTrend] 触发早盘修正: %s", now.isoformat())
+        try:
+            from src.services.global_index_service import fetch_and_save_batch
+            fetch_and_save_batch(["SOXX", "NIKKEI", "KOSPI", "HSI", "HSTECH"])
+            from src.services.ma_trend_scheduler import run_morning_revision
+            result = run_morning_revision()
+            logger.info("[MaTrend] 早盘修正完成: revised=%s", result.get("revised", 0))
+        except Exception as exc:
+            logger.exception("[MaTrend] 早盘修正失败: %s", exc)
+
+    # 午盘预测任务（11:35：用上午行情重跑模型+LLM，预测下午走势）
+    midday_enabled = os.getenv("MA_AGENT_MIDDAY_PREDICTION_ENABLED", "").strip().lower() in {"1", "true", "yes", "on"}
+    midday_time_str = os.getenv("MA_AGENT_MIDDAY_PREDICTION_TIME", "11:35").strip()
+    try:
+        midday_hour, midday_minute = map(int, midday_time_str.split(":"))
+    except (ValueError, TypeError):
+        midday_hour, midday_minute = 11, 35
+    _MIDDAY_TASK_NAME = "ma_trend_midday_prediction"
+
+    def midday_prediction_task() -> None:
+        now = datetime.now(ZoneInfo("Asia/Shanghai"))
+        if not _should_fire(_MIDDAY_TASK_NAME, midday_hour, midday_minute, now):
+            return
+        _mark_fired(_MIDDAY_TASK_NAME)
+        logger.info("[MaTrend] 触发午盘预测: %s", now.isoformat())
+        try:
+            from src.services.ma_trend_scheduler import run_daily_ma_agent
+            result = run_daily_ma_agent(search_news=True, mode="midday")
+            logger.info("[MaTrend] 午盘预测完成: status=%s llm=%s",
+                        result.get("status"), result.get("llm_analyses", 0))
+        except Exception as exc:
+            logger.exception("[MaTrend] 午盘预测失败: %s", exc)
+
+    tasks = [{
         "task": ma_trend_task,
         "interval_seconds": 60,
         "run_immediately": False,
         "name": _MA_TREND_TASK_NAME,
     }]
+
+    if morning_enabled:
+        tasks.append({
+            "task": morning_revision_task,
+            "interval_seconds": 60,
+            "run_immediately": False,
+            "name": _MORNING_TASK_NAME,
+        })
+
+    if midday_enabled:
+        tasks.append({
+            "task": midday_prediction_task,
+            "interval_seconds": 60,
+            "run_immediately": False,
+            "name": _MIDDAY_TASK_NAME,
+        })
+
+    return tasks
 
 
 _GLOBAL_INDEX_TASK_NAME = "global_index_fetch"
@@ -169,16 +237,14 @@ def build_global_index_background_tasks(
 ) -> List[Dict[str, Any]]:
     """Build background tasks that fetch global indices at scheduled times.
 
-    Three time slots (Asia/Shanghai):
-    - 04:00  SOXX（费城半导体，美股收盘后）
-    - 08:30  Nikkei 225, KOSPI（亚太早盘）
-    - 09:15  Hang Seng, Hang Seng Tech（港股开盘后）
+    Single time slot (Asia/Shanghai):
+    - 09:25  SOXX + NIKKEI + KOSPI + HSI + HSTECH
+      （日韩开盘 1.5h、港股开盘 25min、A 股 5min 后开盘，时效最佳）
 
-    Each slot fires at most once per calendar day.  Weekend guard included.
+    Uses DB-persisted run logs so restart doesn't miss the window.
     Controlled by GLOBAL_INDEX_ENABLED env var.
     """
     import os
-    from datetime import date as date_type
     from zoneinfo import ZoneInfo
 
     enabled = os.getenv("GLOBAL_INDEX_ENABLED", "").strip().lower() in {"1", "true", "yes", "on"}
@@ -187,26 +253,17 @@ def build_global_index_background_tasks(
 
     from src.services.global_index_service import _FETCH_SCHEDULES, fetch_and_save_batch, fetch_and_save_global_index
 
-    last_run: Dict[str, date_type | None] = {}  # time_str → last_run_date
-
-    def _build_slot_task(slot_time: str, codes: List[str]):
-        """Create a closure that fires once at slot_time each day."""
+    def _build_slot_task(slot_time: str, codes: List[str], task_name: str):
         try:
             h, m = map(int, slot_time.split(":"))
         except (ValueError, TypeError):
-            h, m = 4, 0
+            h, m = 9, 25
 
         def _task() -> None:
-            nonlocal last_run
             now = datetime.now(ZoneInfo("Asia/Shanghai"))
-            today = now.date()
-            if today.weekday() >= 5:
+            if not _should_fire(task_name, h, m, now):
                 return
-            if last_run.get(slot_time) == today:
-                return
-            if now.hour != h or now.minute != m:
-                return
-            last_run[slot_time] = today
+            _mark_fired(task_name)
             logger.info("[全球指数] 触发 %s 拉取: %s", slot_time, codes)
             try:
                 if len(codes) == 1:
@@ -223,7 +280,7 @@ def build_global_index_background_tasks(
     for slot_time, codes in _FETCH_SCHEDULES.items():
         task_name = f"{_GLOBAL_INDEX_TASK_NAME}_{slot_time.replace(':', '')}"
         tasks.append({
-            "task": _build_slot_task(slot_time, codes),
+            "task": _build_slot_task(slot_time, codes, task_name),
             "interval_seconds": 60,
             "run_immediately": False,
             "name": task_name,
