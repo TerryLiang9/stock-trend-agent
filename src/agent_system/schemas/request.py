@@ -24,7 +24,7 @@ class TrendForecastRequest(BaseModel):
     data_cutoff: Optional[datetime] = None
     run_id: Optional[str] = Field(default=None, max_length=128)
     market_data: Optional[List[Dict[str, Any]]] = None
-    mode: str = Field(default="predict", pattern="^(predict|evaluate|daily_cycle|midday)$")
+    mode: str = Field(default="predict", pattern="^(predict|evaluate|daily_cycle|midday|morning)$")
 
     @field_validator("symbol")
     @classmethod

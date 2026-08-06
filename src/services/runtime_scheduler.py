@@ -170,15 +170,16 @@ def build_ma_trend_background_tasks(
         if not _should_fire(_MORNING_TASK_NAME, morning_hour, morning_minute, now):
             return
         _mark_fired(_MORNING_TASK_NAME)
-        logger.info("[MaTrend] 触发早盘修正: %s", now.isoformat())
+        logger.info("[MaTrend] 触发早盘预测: %s", now.isoformat())
         try:
             from src.services.global_index_service import fetch_and_save_batch
             fetch_and_save_batch(["SOXX", "NIKKEI", "KOSPI", "HSI", "HSTECH"])
-            from src.services.ma_trend_scheduler import run_morning_revision
-            result = run_morning_revision()
-            logger.info("[MaTrend] 早盘修正完成: revised=%s", result.get("revised", 0))
+            from src.services.ma_trend_scheduler import run_daily_ma_agent
+            result = run_daily_ma_agent(search_news=False, mode="morning")
+            logger.info("[MaTrend] 早盘预测完成: status=%s llm=%s",
+                        result.get("status"), result.get("llm_analyses", 0))
         except Exception as exc:
-            logger.exception("[MaTrend] 早盘修正失败: %s", exc)
+            logger.exception("[MaTrend] 早盘预测失败: %s", exc)
 
     # 午盘预测任务（11:35：用上午行情重跑模型+LLM，预测下午走势）
     midday_enabled = os.getenv("MA_AGENT_MIDDAY_PREDICTION_ENABLED", "").strip().lower() in {"1", "true", "yes", "on"}
